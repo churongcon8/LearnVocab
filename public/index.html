@@ -130,7 +130,6 @@ var ST_CONFIG = "hella_vocab_config";
 var ST_LOG = "hella_vocab_log";
 var ST_USERWORDS = "hella_vocab_userwords"; // từ thêm thủ công / từ bị chuyển khỏi chủ đề
 var ST_ACCOUNT = "hella_vocab_account";   // tên tài khoản đang đăng nhập
-var ST_REC5 = "hella_vocab_rec5";         // bật/tắt ghi âm để nghe lại ở Bước 5 (mặc định TẮT)
 var ST_LASTACC = "hella_vocab_lastacc";   // tài khoản đã đồng bộ gần nhất trên máy này
 
 // Đồng bộ tiến độ: hàm Netlify Function (netlify/functions/progress.mjs) lưu trong Netlify Blobs
@@ -577,7 +576,7 @@ function speechErrorInfo(code) {
  }
 }
 
-function startListening(timeoutSec, promptText, callback, audioTrack) {
+function startListening(timeoutSec, promptText, callback) {
  var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
  if (!SpeechRecognition) {
   callback([], "Trình duyệt không hỗ trợ nhận diện giọng nói. Vui lòng dùng Google Chrome (không dùng trình duyệt trong Zalo/Facebook).", true);
@@ -626,7 +625,7 @@ function startListening(timeoutSec, promptText, callback, audioTrack) {
  // chờ một chút để loa tắt hẳn rồi mới mở micro
  setTimeout(function() {
   if (finished) return;
-  try { if (audioTrack) rec.start(audioTrack); else rec.start(); } catch(e) { done([], "Không thể khởi động micro.", true); }
+  try { rec.start(); } catch(e) { done([], "Không thể khởi động micro.", true); }
  }, 350);
 }
 
@@ -744,8 +743,6 @@ function clearTimer() {
  if (timerHandle) { clearTimeout(timerHandle); timerHandle = null; }
  if (speechRec) { try { speechRec.abort(); } catch(e){} speechRec = null; }
  stopSpeaking(); // hủy hẳn cả phần "chờ đọc xong rồi làm tiếp", không chỉ ngắt tiếng
- try { if (window._myVoice) window._myVoice.pause(); } catch (e) {}
- cancelRecording();
 }
 
 // 1. HOME VIEW
@@ -1405,117 +1402,13 @@ function skipStep4() {
 }
 
 // --- STEP 5: LUYỆN ĐỌC CÂU ---
-var s5State = { words: [], index: 0, currentWord: "", attempts: 0, listening: false, done: false, voiceUrl: "", heard: "", noRec: false };
+var s5State = { words: [], index: 0, currentWord: "", attempts: 0, listening: false, done: false };
 
-// --- GHI ÂM GIỌNG NGƯỜI HỌC (để nghe lại sau khi đọc xong câu) ---
-var rec5 = { mr: null, stream: null, chunks: [], mime: "" };
-function recEnabled() { return lsGet(ST_REC5) === "1"; }
-
-// Trình duyệt có hỗ trợ SpeechRecognition.start(MediaStreamTrack) không?
-// Thử với 1 track đã kết thúc: trình duyệt hỗ trợ sẽ báo InvalidStateError; trình duyệt không hỗ trợ bỏ qua tham số
-// (mic vừa mở thì tắt ngay). Kết quả được nhớ lại.
-var _shareMic = null;
-function canShareMic() {
- if (_shareMic !== null) return _shareMic;
- _shareMic = false;
- var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
- var AC = window.AudioContext || window.webkitAudioContext;
- if (!SR || !AC || !navigator.mediaDevices || typeof MediaRecorder === "undefined") return false;
- var ctx = null;
- try {
-  ctx = new AC();
-  var tr = ctx.createMediaStreamDestination().stream.getAudioTracks()[0];
-  tr.stop();
-  var r = new SR();
-  try { r.start(tr); try { r.abort(); } catch (e2) {} }
-  catch (e) { _shareMic = !!(e && e.name === "InvalidStateError"); }
- } catch (e) {}
- try { if (ctx) ctx.close(); } catch (e) {}
- return _shareMic;
-}
-function toggleRec5(on, box) {
- if (on && !canShareMic()) {
-  if (box) box.checked = false;
-  lsSet(ST_REC5, "0");
-  showToast("Trình duyệt này chưa hỗ trợ ghi âm cùng lúc với nhận diện, nên chưa dùng được tính năng nghe lại.");
-  return;
- }
- lsSet(ST_REC5, on ? "1" : "0");
- if (on) showToast("Đã bật: thiết bị này hỗ trợ ghi âm để nghe lại.");
- else { releaseVoice(); showPlay5(); }
-}
-function beginRecording(cb) {
- if (!recEnabled() || !canShareMic() || s5State.noRec || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === "undefined") { cb(false); return; }
- navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
-  try {
-   var mime = "";
-   ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].forEach(function(m) {
-    if (!mime && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) mime = m;
-   });
-   var mr = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-   var r = { mr: mr, stream: stream, chunks: [], mime: mr.mimeType || mime || "audio/webm" };
-   mr.ondataavailable = function(e) { if (e.data && e.data.size) r.chunks.push(e.data); };
-   mr.start();
-   rec5 = r;
-   cb(true);
-  } catch (e) {
-   try { stream.getTracks().forEach(function(t) { t.stop(); }); } catch (e2) {}
-   cb(false);
-  }
- }).catch(function() { cb(false); });
-}
-function stopRecording(cb) {
- var r = rec5;
- if (!r.mr) { cb(""); return; }
- rec5 = { mr: null, stream: null, chunks: [], mime: "" };
- var finished = false;
- function fin() {
-  if (finished) return;
-  finished = true;
-  try { r.stream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
-  var url = "";
-  try { if (r.chunks.length) url = URL.createObjectURL(new Blob(r.chunks, { type: r.mime })); } catch (e) {}
-  cb(url);
- }
- r.mr.onstop = fin;
- try { if (r.mr.state !== "inactive") r.mr.stop(); else fin(); } catch (e) { fin(); }
- setTimeout(fin, 1500);
-}
-function cancelRecording() {
- if (!rec5.mr) return;
- stopRecording(function(url) { if (url) { try { URL.revokeObjectURL(url); } catch (e) {} } });
-}
-function releaseVoice() {
- if (s5State.voiceUrl) { try { URL.revokeObjectURL(s5State.voiceUrl); } catch (e) {} }
- s5State.voiceUrl = "";
- s5State.heard = "";
-}
-function showPlay5() {
- var pb = $('btn-play5');
- if (!pb) return;
- if (!recEnabled() || (!s5State.voiceUrl && !s5State.heard)) { pb.style.display = "none"; return; }
- pb.textContent = s5State.voiceUrl ? "▶ Nghe lại giọng bạn" : "🔊 Nghe lại (giọng máy đọc phần nhận diện được)";
- pb.style.display = "";
-}
-function playMyVoice() {
- stopSpeaking();
- if (s5State.voiceUrl) {
-  try {
-   var a = new Audio(s5State.voiceUrl);
-   window._myVoice = a;
-   var pr = a.play();
-   if (pr && pr.catch) pr.catch(function() { showToast("Không phát được bản ghi âm."); });
-  } catch (e) { showToast("Không phát được bản ghi âm."); }
- } else if (s5State.heard) {
-  speakText(s5State.heard);
- }
-}
 
 function startStep5() {
  clearTimer();
  s5State.words = S.session.words.slice().sort(function() { return 0.5 - Math.random(); });
  s5State.index = 0;
- s5State.noRec = false;
  nextStep5Question();
 }
 
@@ -1531,7 +1424,6 @@ function nextStep5Question() {
  s5State.attempts = 0;
  s5State.listening = false;
  s5State.done = false;
- releaseVoice();
 
  var info = S.session.vocabData[word];
  var ex = info.example || "";
@@ -1549,12 +1441,10 @@ function nextStep5Question() {
              '<div>' +
               '<button class="btn btn-purple" ' + (!ex ? 'disabled' : '') + ' onclick="speakText(' + jsArg(ex) + ')">🔊 Nghe câu mẫu</button>' +
               '<button id="btn-mic5" class="btn btn-success" ' + (!ex ? 'disabled' : '') + ' onclick="listenStep5()">🎙 Đọc nguyên câu</button>' +
-              '<button id="btn-play5" class="btn btn-warning" style="display:none;" onclick="playMyVoice()">▶ Nghe lại giọng bạn</button>' +
                '<button id="btn-skip5" class="btn btn-muted" onclick="skipStep5()">Bỏ qua</button>' +
               '<button id="btn-next5" class="btn btn-primary" style="display:none;" onclick="nextStep5Question()">Từ tiếp theo →</button>' +
              '</div>' +
-             '<label style="display:block; margin-top:8px; font-size:12px; color:#64748B; line-height:1.4;"><input type="checkbox" ' + (recEnabled() ? 'checked ' : '') + 'onchange="toggleRec5(this.checked, this)"> 🎧 Ghi âm để nghe lại giọng mình (tính năng mới, chỉ chạy trên trình duyệt hỗ trợ; nếu thấy nhận diện kém đi hãy tắt)</label>' +
-              '<div style="margin-top:6px;">' +
+             '<div style="margin-top:6px;">' +
               '<button class="btn btn-warning" onclick="openAddWord()">➕ Thêm từ vựng mới</button>' +
              '</div>' +
             '</div>' +
@@ -1581,70 +1471,43 @@ function listenStep5() {
  var btn = $('btn-mic5');
  if (btn) { btn.disabled = true; btn.textContent = "Đang nghe..."; }
  var el = $('s5-status');
- if (el) el.textContent = "🎙 AI đang nghe... Hãy đọc toàn bộ câu.";
- var pb = $('btn-play5');
- if (pb) pb.style.display = "none";
- releaseVoice();
+ if (el) el.textContent = "🎙 Đang nghe... Hãy đọc to, rõ toàn bộ câu.";
 
  var timeLimit = Math.min(15, Math.max(5, Math.floor(ex.split(' ').length * 0.7) + 3));
 
- // Vừa ghi âm (để nghe lại) vừa nhận diện giọng nói
- beginRecording(function(recording) {
-  if (tok !== viewToken) { cancelRecording(); return; }
-  var shareTrack = (recording && rec5.stream) ? rec5.stream.getAudioTracks()[0] : null;
-  startListening(timeLimit, ex, function(results, errorMsg, fatal) {
-   if (tok !== viewToken) { cancelRecording(); return; }
-   s5State.listening = false;
+ startListening(timeLimit, ex, function(results, errorMsg, fatal) {
+  if (tok !== viewToken) return; // đã chuyển câu / mở form thêm từ trong lúc đang nghe
+  s5State.listening = false;
+  if (fatal) {
+   s5State.attempts--;
+   if (el) { el.textContent = "⚠ " + errorMsg; el.style.color = "#EF6461"; }
+   if (btn) { btn.disabled = false; btn.textContent = "🎙 Thử lại"; }
+   return;
+  }
+  var matched = false;
+  var bestText = results[0] || "";
 
-   // Một số máy Android không cho ghi âm và nhận diện cùng lúc => tắt ghi âm, thử lại không tính lượt
-   if (fatal && recording && !s5State.noRec && /Không tìm thấy micro/.test(errorMsg || "")) {
-    cancelRecording();
-    s5State.noRec = true;
-    s5State.attempts--;
-    listenStep5();
-    return;
+  results.forEach(function(res) {
+   if (stringSimilarity(res, ex) >= 0.55) {
+    matched = true;
+    bestText = res;
    }
+  });
 
-   stopRecording(function(url) {
-    if (tok !== viewToken) { if (url) { try { URL.revokeObjectURL(url); } catch (e) {} } return; }
-
-    if (fatal) {
-     if (url) { try { URL.revokeObjectURL(url); } catch (e) {} }
-     s5State.attempts--;
-     if (el) { el.textContent = "⚠ " + errorMsg; el.style.color = "#EF6461"; }
-     if (btn) { btn.disabled = false; btn.textContent = "🎙 Thử lại"; }
-     return;
-    }
-
-    var matched = false;
-    var bestText = results[0] || "";
-    results.forEach(function(res) {
-     if (stringSimilarity(res, ex) >= 0.55) {
-      matched = true;
-      bestText = res;
-     }
-    });
-
-    s5State.voiceUrl = url;
-    s5State.heard = bestText;
-    showPlay5();
-
-    if (matched) {
-     S.session.step5Score++;
-     if (el) { el.textContent = "✓ Đã đọc đạt yêu cầu! (AI nghe: " + bestText + ")"; el.style.color = "#00A878"; }
-     endStep5Word();
-    } else {
-     if (s5State.attempts < 3) {
-      if (el) { el.textContent = "Chưa khớp đủ với câu mẫu (Nghe được: " + (bestText || "Chưa rõ") + "). Thử lại!"; el.style.color = "#EF6461"; }
-      if (btn) { btn.disabled = false; btn.textContent = "🎙 Thử đọc lại"; }
-     } else {
-      markWordWrong(s5State.currentWord);
-      if (el) { el.textContent = "✗ Chưa nhận diện đủ câu sau 3 lần."; el.style.color = "#EF6461"; }
-      endStep5Word();
-     }
-    }
-   });
-  }, shareTrack);
+  if (matched) {
+   S.session.step5Score++;
+   if (el) { el.textContent = "✓ Đã đọc đạt yêu cầu! (Nghe được: " + bestText + ")"; el.style.color = "#00A878"; }
+   endStep5Word();
+  } else {
+   if (s5State.attempts < 3) {
+    if (el) { el.textContent = "Chưa khớp đủ với câu mẫu (Nghe được: " + (bestText || "Chưa rõ") + "). Thử lại!"; el.style.color = "#EF6461"; }
+    if (btn) { btn.disabled = false; btn.textContent = "🎙 Thử đọc lại"; }
+   } else {
+    markWordWrong(s5State.currentWord);
+    if (el) { el.textContent = "✗ Chưa nhận diện đủ câu sau 3 lần."; el.style.color = "#EF6461"; }
+    endStep5Word();
+   }
+  }
  });
 }
 
